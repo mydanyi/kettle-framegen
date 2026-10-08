@@ -186,18 +186,15 @@ void main()
     mediump float cost[6];
     float spread = 0.0;  // how far apart the nearest blocks' vectors are from the field here
     float matched = 1.0;  // the best match cost around (filter.comp: of 3x3 blocks), interpolated
+    float fade = 0.0;     // filter.comp's stage-2 opacity-fade confidence here, 0..1 (bilinear)
     vec2 rcp = 1.0 / pc.size, dx = vec2(1.0, 0.0);
     mediump vec4 sa = textureLod(prev_img, q * rcp, 0.0), sb = textureLod(cur_img, q * rcp, 0.0);
     if (flow) {
-        if (diff(sa, sb) + diff(textureLod(prev_img, (q - dx) * rcp, 0.0), textureLod(cur_img, (q - dx) * rcp, 0.0)) +
-                diff(textureLod(prev_img, (q + dx) * rcp, 0.0), textureLod(cur_img, (q + dx) * rcp, 0.0)) < 0.03) {
-            imageStore(dst, p, uvec4(pack(mix(sa, sb, pc.t))));  // still
-            return;
-        }
         vec2 f = q * pc.mv_uv * vec2(grid) - 0.5;  // position in the block grid
         ivec2 i = ivec2(floor(f));
         ivec2 last = grid - 1;
         vec4 here = textureLod(mv, q * pc.mv_uv, 0.0);
+        fade = clamp(here.z, 0.0, 1.0);
         cand[0] = here.xy * pc.mv_to_px;
         // interpolated, not the nearest blocks' least: where the fallback below starts and
         // stops it fades over a block instead of showing the block grid (rectangles of the
@@ -226,6 +223,38 @@ void main()
         // where that frame had it (a halo growing with the speed)
         lost *= 1.0 - smoothstep(EDGE, 2.0 * EDGE, spread);
         cand[5] = vec2(0.0);
+        // The three-pixel agreement alone is not proof of a still pixel: a moving thin line
+        // whose intermediate position is flat in both original frames matches here too. Take it
+        // only when the still mask (same-size) marks this pixel, or the motion here is provably
+        // zero. Zero motion = all five field candidates exactly vec2(0), the field's own match
+        // cost below LOST_FROM, and cut.bad_blocks*20 < uint(blocks)*3 (fraction < 15%, so
+        // scale stays 1 and lost stays 0). It is an equivalent path, not a guess: with every
+        // candidate zero, vb = vf = cand[0] gives no occlusion displacement, spread is 0, and
+        // the blend below reduces exactly to mix(sa, sb, t) -- all six try_vector reads land on
+        // the same two samples (a, b = sa, sb), w and lost are 0, no occlusion fires, and the
+        // fade mix blends that value with itself. A moving candidate is never fast-returned, so
+        // thin lines stay reachable and are reconstructed.
+        if (diff(sa, sb) + diff(textureLod(prev_img, (q - dx) * rcp, 0.0), textureLod(cur_img, (q - dx) * rcp, 0.0)) +
+                diff(textureLod(prev_img, (q + dx) * rcp, 0.0), textureLod(cur_img, (q + dx) * rcp, 0.0)) < 0.03) {
+            bool zero_motion = all(equal(cand[0], vec2(0.0))) &&
+                               all(equal(cand[1], vec2(0.0))) &&
+                               all(equal(cand[2], vec2(0.0))) &&
+                               all(equal(cand[3], vec2(0.0))) &&
+                               all(equal(cand[4], vec2(0.0)));
+            zero_motion = zero_motion && here.w < LOST_FROM &&
+                          cut.bad_blocks * 20u < uint(grid.x * grid.y) * 3u;
+            if (texelFetch(hud, p, 0).r > 0.5 || zero_motion) {
+                imageStore(dst, p, uvec4(pack(mix(sa, sb, pc.t))));  // still
+                return;
+            }
+        }
+        // filter.comp's stage-2 temporal confidence marks a stationary-coordinate opacity
+        // change (the previous frame's luma fade delta does not move with the vectors), so the
+        // layer is interpolated locally rather than blended as a whole frame would be
+        if (here.z > 0.99) {
+            imageStore(dst, p, uvec4(pack(mix(sa, sb, pc.t))));
+            return;
+        }
         for (int k = 0; k < 6; k++)
             cost[k] = try_vector(q, cand[k], k == 0 ? 0.0 : k < 5 ? 0.04 : 0.08);
     } else {
@@ -292,5 +321,9 @@ void main()
         }
         c = mix(c, fallback, lost);
     }
+    // where stage-2 only partially marks the layer (its bilinear border: filter reads its
+    // confidence at block centres), fade between the motion result and a plain local blend
+    // instead of ignoring every partial mask; 0 keeps the motion result, 1 the local blend
+    c = mix(c, mix(sa, sb, pc.t), fade);
     imageStore(dst, p, uvec4(pack(c)));
 }

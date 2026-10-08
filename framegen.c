@@ -501,7 +501,7 @@ static bool pipelines_create(struct dev *d)
         if (d->pipe[p])
             continue;
         const struct pipe_spec *s = &pipe_specs[p];
-        VkDescriptorSetLayoutBinding b[5];
+        VkDescriptorSetLayoutBinding b[6];
         for (uint32_t i = 0; i < s->n; i++)
             b[i] = (VkDescriptorSetLayoutBinding){ i, s->types[i], 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL };
         VkDescriptorSetLayoutCreateInfo dci = {
@@ -867,9 +867,9 @@ static bool flow_build(struct swapchain *sc, float flow_scale)
         return false;
 
     VkDescriptorPoolSize sizes[] = {
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * (1 + MAX_LEVELS + 4 * MAX_LEVELS + 1 + 2 + 4 * MAX_GEN) },
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * (2 + MAX_LEVELS + 4 * MAX_LEVELS + 3 + 2 + 4 * MAX_GEN) },
         { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 * (1 + MAX_LEVELS + MAX_LEVELS + 1 + 1 + MAX_GEN) },
-        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 * (1 + MAX_GEN) },
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 * (2 + MAX_GEN) },
     };
     VkDescriptorPoolCreateInfo dci = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
@@ -882,7 +882,10 @@ static bool flow_build(struct swapchain *sc, float flow_scale)
     // Sets per history slot c (the slot the current frame is in; c ^ 1 holds the previous)
     for (int c = 0; c < 2; c++) {
         int p = c ^ 1;
-        bool ok = (sc->ds_luma[c] = ds_make(sc, P_LUMA, (VkImageView[]){ sc->hist[c].view, sc->pyr_level[c][0] }));
+        // luma0: colour in, level-0 luma out, the previous frame's level-0 luma for the fade
+        // delta; the trailing NULL is the Cut buffer ds_make binds for the B slot
+        bool ok = (sc->ds_luma[c] = ds_make(sc, P_LUMA, (VkImageView[]){ sc->hist[c].view, sc->pyr_level[c][0],
+                                                                         sc->pyr_level[p][0], VK_NULL_HANDLE }));
         for (uint32_t l = 1; l < sc->levels; l++)
             ok = ok && (sc->ds_down[c][l] = ds_make(sc, P_DOWN, (VkImageView[]){ sc->pyr[c].view, sc->pyr_level[c][l] }));
         for (uint32_t l = 0; l < sc->levels; l++) {
@@ -891,7 +894,11 @@ static bool flow_build(struct swapchain *sc, float flow_scale)
             ok = ok && (sc->ds_motion[c][l] = ds_make(sc, P_MOTION, (VkImageView[]){
                             sc->pyr[p].view, sc->pyr[c].view, coarse, sc->mvf[p].view, sc->mvl[l].view }));
         }
-        ok = ok && (sc->ds_filter[c] = ds_make(sc, P_FILTER, (VkImageView[]){ sc->mvl[0].view, sc->mvf[c].view }));
+        // filter: the block field into the median, into mvf[c]; the NULL is the Cut buffer;
+        // the level-0 luma pair feeds the stage-2 temporal confidence
+        ok = ok && (sc->ds_filter[c] = ds_make(sc, P_FILTER, (VkImageView[]){
+                        sc->mvl[0].view, sc->mvf[c].view, VK_NULL_HANDLE,
+                        sc->pyr_level[p][0], sc->pyr_level[c][0] }));
         ok = ok && (sc->ds_still[c] = ds_make(sc, P_STILL, (VkImageView[]){ sc->hist[p].view, sc->hist[c].view, sc->still.view }));
         for (int k = 0; k < MAX_GEN; k++)
             ok = ok && (sc->ds_synth[c][k] = ds_make(sc, P_SYNTH, (VkImageView[]){
@@ -1016,14 +1023,12 @@ static void record(struct swapchain *sc, VkCommandBuffer cmd, int slot, uint32_t
     image_barrier(d, cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                   layout_change(sc->images[idx], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                 VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, 0, 0));
-    if (ngen && flow)
-        d->CmdFillBuffer(cmd, sc->cut, 0, VK_WHOLE_SIZE, 0);  // filter.comp counts afresh
     barrier(d, cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
 
-    // 2. its luma pyramid
-    int32_t bgr = sc->bgr;
-    run(d, cmd, P_LUMA, sc->ds_luma[c], &bgr, sizeof(bgr), sc->luma[0]);
+    // 2. its luma pyramid (luma0 also reads the previous frame's Cut for its fade gate)
+    struct luma_pc lpc = { sc->bgr, sc->have_prev ? 1 : 0, sc->have_mv ? 1 : 0, flow ? 1 : 0 };
+    run(d, cmd, P_LUMA, sc->ds_luma[c], &lpc, sizeof(lpc), sc->luma[0]);
     for (uint32_t l = 1; l < sc->levels; l++) {
         compute_to_compute(d, cmd);
         int32_t src = l - 1;
@@ -1031,6 +1036,16 @@ static void record(struct swapchain *sc, VkCommandBuffer cmd, int slot, uint32_t
     }
     compute_to_compute(d, cmd);
     STAMP(TS_PYRAMID);
+
+    // luma0 has now read the previous frame's Cut, so reset it for filter.comp to count afresh
+    if (ngen && flow) {
+        barrier(d, cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        d->CmdFillBuffer(cmd, sc->cut, 0, VK_WHOLE_SIZE, 0);
+        barrier(d, cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    }
 
     if (ngen) {
         // 3. motion, coarse to fine, then the median filter into mvf[c]
@@ -1040,7 +1055,8 @@ static void record(struct swapchain *sc, VkCommandBuffer cmd, int slot, uint32_t
                 run(d, cmd, P_MOTION, sc->ds_motion[c][l], &pc, sizeof(pc), sc->mv[l]);
                 compute_to_compute(d, cmd);
             }
-            run(d, cmd, P_FILTER, sc->ds_filter[c], NULL, 0, sc->mv[0]);
+            struct filter_pc fpc = { sc->have_mv };
+            run(d, cmd, P_FILTER, sc->ds_filter[c], &fpc, sizeof(fpc), sc->mv[0]);
             run(d, cmd, P_STILL, sc->ds_still[c], NULL, 0, full);
             compute_to_compute(d, cmd);
         }

@@ -3,14 +3,24 @@
 // colour (blue and red difference from luma, around 0.5) in .g and .b: motion.comp weighs those
 // in too, so edges between colours of the same brightness don't look flat.
 // Four bilinear taps per output texel, so downscales to ~1/4 still average every source pixel.
+// .a carries the signed luma delta against the previous original frame (0 = no valid previous),
+// stored around the exact neutral 128/255 and scaled 2x with the delta clamped to +/-0.24, so the
+// byte carries 4x finer luma precision; the later temporal fade weights it; RGB is unchanged.
 #version 450
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(binding = 0) uniform sampler2D color;
 layout(binding = 1, rgba8) uniform writeonly image2D dst;
+layout(binding = 2) uniform sampler2D prev_pyr;  // previous frame's level-0 luma; its .a is the fade delta
+layout(binding = 3, std430) readonly buffer Cut {
+    uint bad_blocks;  // previous frame's bad level-0 motion blocks (filter.comp counts afresh)
+} cut;
 
 layout(push_constant) uniform PC {
-    int bgr;  // the copied swapchain image is BGRA: its raw .r is blue
+    int bgr;        // the copied swapchain image is BGRA: its raw .r is blue
+    int have_prev;  // a previous original frame exists (not the first frame)
+    int have_mv;    // its motion vectors are valid, so the Cut gate may be read
+    int flow;       // flow interpolation is on this frame
 } pc;
 
 vec3 ycc(vec4 c)
@@ -33,5 +43,23 @@ void main()
              ycc(textureLod(color, uv + vec2( o.x, -o.y), 0.0)) +
              ycc(textureLod(color, uv + vec2(-o.x,  o.y), 0.0)) +
              ycc(textureLod(color, uv + vec2( o.x,  o.y), 0.0));
-    imageStore(dst, p, vec4(0.25 * l, 0.0));
+    vec3 rgb = 0.25 * l;
+
+    // .a is the signed luma delta against the previous original frame, stored around the exact
+    // neutral 128/255 and scaled 2x with the delta clamped to +/-0.24: 0 means "no valid previous
+    // sample" and is never reached by a valid delta, and the clamp also keeps it below 1.0 so the
+    // byte never saturates (large changes are handled by the cut). RGB is left byte-for-byte as
+    // before, so the fade reads only .r and .a.
+    float a = 0.0;
+    if (pc.flow != 0 && pc.have_prev != 0) {
+        bool bad = false;
+        if (pc.have_mv != 0) {
+            ivec2 grid = (size + 7) / 8;  // level-0 motion grid = ceil(level0size / BLOCK)
+            uint cells = uint(grid.x) * uint(grid.y);
+            bad = cells > 0u && float(cut.bad_blocks) / float(cells) > 0.30;
+        }
+        if (!bad)
+            a = 128.0 / 255.0 + 2.0 * clamp(rgb.x - texelFetch(prev_pyr, p, 0).r, -0.24, 0.24);
+    }
+    imageStore(dst, p, vec4(rgb, a));
 }

@@ -25,10 +25,10 @@ static const struct pipe_spec {
     uint32_t n;
     VkDescriptorType types[6];
 } pipe_specs[NPIPE] = {
-    [P_LUMA] = { spv_luma0, sizeof(spv_luma0), 2, { S, W } },
+    [P_LUMA] = { spv_luma0, sizeof(spv_luma0), 4, { S, W, S, B } },
     [P_DOWN] = { spv_down, sizeof(spv_down), 2, { S, W } },
     [P_MOTION] = { spv_motion, sizeof(spv_motion), 5, { S, S, S, S, W } },
-    [P_FILTER] = { spv_filter, sizeof(spv_filter), 3, { S, W, B } },
+    [P_FILTER] = { spv_filter, sizeof(spv_filter), 5, { S, W, B, S, S } },
     [P_STILL] = { spv_still, sizeof(spv_still), 3, { S, S, W } },
     [P_SYNTH] = { spv_synth, sizeof(spv_synth), 6, { S, S, S, W, B, S } },
 };
@@ -67,12 +67,22 @@ static inline uint32_t flow_geometry(VkExtent2D full, float flow_scale, VkExtent
     return levels;
 }
 
-// luma0.comp takes an int32 (bgr), down.comp an int32 (source level), filter.comp nothing
+// luma0.comp takes a luma_pc, down.comp an int32 (source level), filter.comp a filter_pc
+
+struct luma_pc {
+    int32_t bgr, have_prev, have_mv, flow;
+};
 
 struct motion_pc {
     float luma_size[2], mv0_size[2];
     int32_t level, coarsest, use_temporal;
     float lambda;
+};
+
+// filter.comp: have_mv gates the stage-2 temporal confidence written to the vector record's .z
+// (bindings 3 and 4 are the level-0 luma pair it compares). Zero keeps confidence zero.
+struct filter_pc {
+    int32_t have_mv;
 };
 
 static inline struct motion_pc motion_push(const VkExtent2D *luma, const VkExtent2D *mv, uint32_t levels,
@@ -104,4 +114,5 @@ static inline struct synth_pc synth_push(VkExtent2D full, const VkExtent2D *luma
     };
 }
 
-_Static_assert(sizeof(struct motion_pc) <= PUSH_SIZE && sizeof(struct synth_pc) <= PUSH_SIZE, "PUSH_SIZE");
+_Static_assert(sizeof(struct luma_pc) <= PUSH_SIZE && sizeof(struct motion_pc) <= PUSH_SIZE &&
+               sizeof(struct filter_pc) <= PUSH_SIZE && sizeof(struct synth_pc) <= PUSH_SIZE, "PUSH_SIZE");

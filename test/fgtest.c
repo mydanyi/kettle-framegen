@@ -194,7 +194,7 @@ static void device_init(int index)
     CHECK(vkCreateSampler(dev, &sampler_info, NULL, &sampler));
     for (int p = 0; p < NPIPE; p++) {
         const struct pipe_spec *s = &pipe_specs[p];
-        VkDescriptorSetLayoutBinding b[5];
+        VkDescriptorSetLayoutBinding b[6];
         for (uint32_t i = 0; i < s->n; i++)
             b[i] = (VkDescriptorSetLayoutBinding){ i, s->types[i], 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL };
         VkDescriptorSetLayoutCreateInfo lci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
@@ -385,9 +385,9 @@ static void run_create(struct run *R, VkExtent2D full, float flow_scale)
     buf_create(&R->down, one * MAX_GEN + 16, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
 
     VkDescriptorPoolSize sizes[] = {
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * (1 + MAX_LEVELS + 4 * MAX_LEVELS + 1 + 2 + 4 * MAX_GEN) },
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * (2 + MAX_LEVELS + 4 * MAX_LEVELS + 3 + 2 + 4 * MAX_GEN) },
         { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 * (1 + MAX_LEVELS + MAX_LEVELS + 1 + 1 + MAX_GEN) },
-        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 * (1 + MAX_GEN) },
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 * (2 + MAX_GEN) },
     };
     VkDescriptorPoolCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
                                        .maxSets = 2 * (1 + MAX_LEVELS + MAX_LEVELS + 1 + 1 + MAX_GEN),
@@ -395,7 +395,10 @@ static void run_create(struct run *R, VkExtent2D full, float flow_scale)
     CHECK(vkCreateDescriptorPool(dev, &dci, NULL, &R->dpool));
     for (int c = 0; c < 2; c++) {
         int p = c ^ 1;
-        R->ds_luma[c] = ds_make(R, P_LUMA, (VkImageView[]){ R->hist[c].view, R->pyr_level[c][0] });
+        // luma0: colour in, level-0 luma out, the previous frame's level-0 luma for the fade
+        // delta; the trailing NULL is the Cut buffer ds_make binds for the B slot
+        R->ds_luma[c] = ds_make(R, P_LUMA, (VkImageView[]){ R->hist[c].view, R->pyr_level[c][0], R->pyr_level[p][0],
+                                                            VK_NULL_HANDLE });
         for (uint32_t l = 1; l < R->levels; l++)
             R->ds_down[c][l] = ds_make(R, P_DOWN, (VkImageView[]){ R->pyr[c].view, R->pyr_level[c][l] });
         for (uint32_t l = 0; l < R->levels; l++) {
@@ -403,7 +406,8 @@ static void run_create(struct run *R, VkExtent2D full, float flow_scale)
             R->ds_motion[c][l] = ds_make(R, P_MOTION, (VkImageView[]){ R->pyr[p].view, R->pyr[c].view, coarse,
                                                                        R->mvf[p].view, R->mvl[l].view });
         }
-        R->ds_filter[c] = ds_make(R, P_FILTER, (VkImageView[]){ R->mvl[0].view, R->mvf[c].view });
+        R->ds_filter[c] = ds_make(R, P_FILTER, (VkImageView[]){ R->mvl[0].view, R->mvf[c].view, VK_NULL_HANDLE,
+                                                                R->pyr_level[p][0], R->pyr_level[c][0] });
         R->ds_still[c] = ds_make(R, P_STILL, (VkImageView[]){ R->hist[p].view, R->hist[c].view, R->still.view });
         for (int k = 0; k < MAX_GEN; k++)
             R->ds_synth[c][k] = ds_make(R, P_SYNTH, (VkImageView[]){ R->hist[p].view, R->hist[c].view,
@@ -501,26 +505,42 @@ static void frame(struct run *R, const struct pic *pic, int c, bool first, uint3
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                              VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0,
                              NULL, n, b);
+    } else {
+        // earlier frames' writes to the slot, pyramid and Cut must be visible before luma0 reads
+        // them; production has the same barrier, and queue idle alone does not make it automatic
+        barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT |
+                    VK_ACCESS_SHADER_WRITE_BIT);
     }
 
     // 1. the frame into history
     VkBufferImageCopy region = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
                                  .imageExtent = { full.width, full.height, 1 } };
     vkCmdCopyBufferToImage(cmd, R->up.buffer, R->hist[c].image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
-    if (ngen && flow)
-        vkCmdFillBuffer(cmd, R->cut.buffer, 0, VK_WHOLE_SIZE, 0);
     barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
 
-    // 2. its luma pyramid
-    int32_t bgr = 0;
-    dispatch(cmd, P_LUMA, R->ds_luma[c], &bgr, sizeof(bgr), R->luma[0]);
+    // 2. its luma pyramid (luma0 also reads the previous frame's Cut for its fade gate)
+    struct luma_pc lpc = { 0, first ? 0 : 1, have_mv ? 1 : 0, flow ? 1 : 0 };
+    dispatch(cmd, P_LUMA, R->ds_luma[c], &lpc, sizeof(lpc), R->luma[0]);
     for (uint32_t l = 1; l < R->levels; l++) {
         compute_to_compute(cmd);
         int32_t src = l - 1;
         dispatch(cmd, P_DOWN, R->ds_down[c][l], &src, sizeof(src), R->luma[l]);
     }
     compute_to_compute(cmd);
+
+    // luma0 has now read the previous frame's Cut, so reset it for filter.comp to count afresh
+    if (ngen && flow) {
+        barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        vkCmdFillBuffer(cmd, R->cut.buffer, 0, VK_WHOLE_SIZE, 0);
+        barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    }
 
     if (ngen) {
         // 3. motion, coarse to fine, then the median filter into mvf[c]
@@ -530,7 +550,8 @@ static void frame(struct run *R, const struct pic *pic, int c, bool first, uint3
                 dispatch(cmd, P_MOTION, R->ds_motion[c][l], &pc, sizeof(pc), R->mv[l]);
                 compute_to_compute(cmd);
             }
-            dispatch(cmd, P_FILTER, R->ds_filter[c], NULL, 0, R->mv[0]);
+            struct filter_pc fpc = { have_mv };
+            dispatch(cmd, P_FILTER, R->ds_filter[c], &fpc, sizeof(fpc), R->mv[0]);
             dispatch(cmd, P_STILL, R->ds_still[c], NULL, 0, full);
             compute_to_compute(cmd);
         }

@@ -5,6 +5,9 @@
 // BAD_COST): when most are, the frames are unrelated (a scene cut) and synth.comp stops
 // interpolating. Also sums the vectors, whose mean picks out the background where two motions
 // meet (synth.comp).
+// The output's .z (a block's match cost, which synth.comp does not read there) carries the
+// stage-2 temporal confidence of the chosen vector: whether the previous frame's luma fade
+// delta moves with it (temporal_conf below).
 #version 450
 layout(local_size_x = 8, local_size_y = 8) in;
 
@@ -15,9 +18,123 @@ layout(binding = 2) buffer Cut {
     ivec2 sum;  // vectors, level-0 pixels in 1/16ths
 } cut;
 
+layout(binding = 3) uniform sampler2D prev_pyr;  // level-0 luma, previous frame
+layout(binding = 4) uniform sampler2D cur_pyr;   // level-0 luma, current frame
+
+layout(push_constant) uniform PC {
+    int have_mv;  // nonzero: the previous frame's levels exist (motion.comp ran)
+} pc;
+
 const float BAD_COST = 0.08;  // motion.comp stores the mean per-sample difference in .z
 
 shared ivec2 group_sum;  // summed per workgroup first: one global atomic per 64 blocks
+
+// Stage-2 temporal confidence: does the previous frame's per-pixel luma fade delta (the level-0
+// luma's alpha, luma0.comp, stored 2x about 128/255 and decoded here with a 0.5 weight) move with
+// the chosen median vector? Over a 4x4 tap grid the current
+// luma difference dn is fitted on the previous delta dp, and once more on the delta dm the
+// vector transports from the previous frame. The fit is accepted when dp carries real signal,
+// dn is not flat, the two agree positively with a sane gain, and the fixed-coordinate residual
+// ez is small; for motion wider than three quarters of a level-0 pixel it is rejected when the
+// fixed zero-coordinate fade fit is clearly worse than the transported one (that is, when ez is
+// above the transport residual em by more than the slack), because a fixed coordinate that fits
+// clearly worse than the transported one means the fade is moving with the vector. A tie between
+// these luma fits is not proof the vector is safe, though: it only means the ambiguity the
+// transport test exists for is not ruled out here, so a tie is a weak accept, not a claim.
+// The RGB structure is vetoed in only for those same wide-motion ties: a clear fixed-coordinate
+// win is accepted and a clear fixed-coordinate loss is already rejected, so only the ambiguous
+// middle reaches here. A centered positive-gain affine fit predicts the current color C from the
+// previous color P at the fixed coordinate and from the color T the vector transports.
+// When the current and transported colors both carry signal, the transported fit is positively
+// correlated and tight, and the fixed fit is clearly worse, the color texture demonstrably moves
+// with the vector, so the fade must not replace that geometric motion and temporal_conf returns
+// 0. This reuses the pa/pb/ta already fetched, so it adds no texture reads.
+// Small vectors keep the fixed-coordinate test alone. Returns 1 to accept, else 0. One
+// conservative zero on ragged input: bad history, a shifted sample off frame, a flat tap.
+// Weak quantized deltas, a moving gradient and the very first pair are where this is least sure.
+float temporal_conf(ivec2 b, vec2 vec)
+{
+    if (pc.have_mv == 0)
+        return 0.0;
+    ivec2 l0 = textureSize(prev_pyr, 0);
+    vec2 rcp = 1.0 / vec2(l0);
+    ivec2 base = b * 8;
+    vec3 cw = vec3(1.0, 2.0, 2.0);  // per-channel weights for the structural color fit
+    vec3 sumP = vec3(0.0), sumC = vec3(0.0), sumT = vec3(0.0);
+    float ep = 0.0, ec = 0.0, et = 0.0, cp = 0.0, ct = 0.0;
+    float Az = 0.0, B = 0.0, S = 0.0, Am = 0.0, Sm = 0.0;
+    for (int j = 0; j < 4; j++) {
+        for (int i = 0; i < 4; i++) {
+            vec2 uv = vec2(base + ivec2(2 * i + 1, 2 * j + 1)) * rcp;
+            vec2 suv = uv - vec * rcp;  // where the previous delta would have come from
+            if (any(lessThan(suv, vec2(0.0))) || any(greaterThan(suv, vec2(1.0))))
+                return 0.0;
+            vec4 pa = textureLod(prev_pyr, uv, 0.0);
+            vec4 pb = textureLod(cur_pyr, uv, 0.0);
+            vec4 ta = textureLod(prev_pyr, suv, 0.0);
+            if (pa.a <= 0.01 || pb.a <= 0.01 || ta.a <= 0.01)
+                return 0.0;  // no fade history here
+            // luma0 stores the delta scaled 2x around 128/255; decode with a 0.5 weight.
+            float dp = 0.5 * (pa.a - 128.0 / 255.0);
+            float dn = pb.r - pa.r;
+            float dm = 0.5 * (ta.a - 128.0 / 255.0);
+            Az += dp * dp;
+            B += dn * dn;
+            S += dp * dn;
+            Am += dm * dm;
+            Sm += dm * dn;
+            vec3 P = pa.rgb * cw;
+            vec3 C = pb.rgb * cw;
+            vec3 T = ta.rgb * cw;
+            sumP += P;
+            sumC += C;
+            sumT += T;
+            ep += dot(P, P);
+            ec += dot(C, C);
+            et += dot(T, T);
+            cp += dot(P, C);
+            ct += dot(T, C);
+        }
+    }
+    // weakdelta accuracy: the alpha fade delta is quantized finer than the luma match cost, so the
+    // dp/dn signal gates are loosened to admit weaker-but-still-real deltas; the fit below must
+    // still pass on that weak signal for a vector to be accepted.
+    if (!(Az / 16.0 > 0.00001) || !(B / 16.0 > 0.00001) || !(S > 0.0))
+        return 0.0;
+    float gain = S / Az;
+    if (gain < 0.1 || gain > 8.0)
+        return 0.0;
+    float ez = max(0.0, B - S * S / Az) / 16.0;
+    // weakdelta accuracy: finer alpha quantization tightens the fixed-coordinate residual floor
+    // (4e-6 vs 3e-5) and leans more on the data term (0.05 vs 0.025), so a weak-signal fit is held
+    // to account rather than accepted trivially.
+    if (!(ez < max(0.000004, 0.05 * B / 16.0)))
+        return 0.0;
+    float em = 1e30;
+    if (Am > 1e-8 && Sm > 0.0)
+        em = max(0.0, B - Sm * Sm / Am) / 16.0;
+    if (length(vec) > 0.75 && ez > em + max(0.00002, 0.02 * B / 16.0))
+        return 0.0;
+    // Color structural veto, only where the luma test did not already reject: wide motion, and no
+    // clear fixed-coordinate win over the transported fade fit (a tie, or transport ahead). A
+    // centered positive-gain affine fit of the current weighted RGB C is built once on the fixed
+    // previous color P and once on the transported previous color T; VP/VC/VT are their centered
+    // sums of squares, CP/CT the centered cross terms, and E0/ET the fits' centered residuals.
+    if (length(vec) > 0.75 && !(ez + max(0.00002, 0.02 * B / 16.0) < em)) {
+        float VP = max(0.0, ep - dot(sumP, sumP) / 16.0);
+        float VC = max(0.0, ec - dot(sumC, sumC) / 16.0);
+        float VT = max(0.0, et - dot(sumT, sumT) / 16.0);
+        float CP = cp - dot(sumP, sumC) / 16.0;
+        float CT = ct - dot(sumT, sumC) / 16.0;
+        float E0 = max(0.0, VC - max(CP, 0.0) * max(CP, 0.0) / max(VP, 1e-8)) / 16.0;
+        float ET = max(0.0, VC - max(CT, 0.0) * max(CT, 0.0) / max(VT, 1e-8)) / 16.0;
+        if (VC / 16.0 > 0.00015 && VT / 16.0 > 0.00015 && CT > 0.0 &&
+            ET < max(0.00005, 0.1 * VC / 16.0) &&
+            E0 > ET + max(0.00005, 0.25 * VC / 16.0))
+            return 0.0;  // transported color texture clearly survives better than fixed: keep motion
+    }
+    return 1.0;
+}
 
 void main()
 {
@@ -46,7 +163,7 @@ void main()
         float region = v[0].z;  // the best match cost around: synth.comp falls back where it's poor
         for (int i = 1; i < 9; i++)
             region = min(region, v[i].z);
-        imageStore(dst, b, vec4(v[best].xy, v[4].z, region));
+        imageStore(dst, b, vec4(v[best].xy, temporal_conf(b, v[best].xy), region));
         if (v[4].z > BAD_COST)
             atomicAdd(cut.bad_blocks, 1u);
         ivec2 s = ivec2(round(v[best].xy * 16.0));

@@ -24,6 +24,34 @@ void main()
     ivec2 size = imageSize(dst);
     if (any(greaterThanEqual(p, size)))
         return;
-    float moved = diff(texelFetch(prev_img, p, 0), texelFetch(cur_img, p, 0));
-    imageStore(dst, p, vec4(moved < 0.02 ? 1.0 : 0.0));
+    vec4 prevcenter = texelFetch(prev_img, p, 0);
+    vec4 curcenter = texelFetch(cur_img, p, 0);
+    float moved = diff(prevcenter, curcenter);
+    // A moved centre is not a stationary overlay at all: bail before the neighbour reads.
+    if (moved >= 0.02)
+    {
+        imageStore(dst, p, vec4(0.0));
+        return;
+    }
+    // A stationary uniform colour says nothing about the HUD: the previous frame being flat
+    // at this pixel means a sample here could be the scene just as well, so the vector is not
+    // proven wrong and motion must be evaluated. Only where the previous pixel sits on local
+    // structure (a HUD edge or glyph, not blank colour) does "unchanged" pin it as an overlay.
+    ivec2 last = size - 1;
+    ivec2 off[4] = ivec2[4](ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1));
+    float st = 0.0;
+    for (int i = 0; i < 4; ++i)
+    {
+        ivec2 q = clamp(p + off[i], ivec2(0), last);
+        vec4 prevn = texelFetch(prev_img, q, 0);
+        vec4 curn = texelFetch(cur_img, q, 0);
+        // Previous-neighbour contrast alone is not enough: if the neighbour moved, that
+        // contrast is the motion, not a static edge. Require the neighbour to be unchanged.
+        if (diff(prevn, curn) >= 0.02)
+            continue;
+        // The edge must be real and static: the neighbour contrasts with the centre in the
+        // previous frame AND in the current one, so it cannot be a moving edge either.
+        st = max(st, min(diff(prevcenter, prevn), diff(curcenter, curn)));
+    }
+    imageStore(dst, p, vec4(st > 0.04 ? 1.0 : 0.0));
 }
